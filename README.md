@@ -63,4 +63,6 @@ python git_graph_viewer.py C:\path\to\your\repo
 
 ## License
 
-依個人需求自由使用、修改。
+本專案採用 MIT License 為基礎，並額外加上「禁止用於收費產品/服務」的限制條款。
+可以自由使用、修改、散布（包含修改後僅供個人使用），但不得將本軟體（無論原始或修改後）
+販售、收費授權，或包裝進任何收費販售的產品或服務中。詳細條款請見 [LICENSE](LICENSE) 檔案。
