@@ -7,7 +7,8 @@
 - **Commit Graph 視覺化**：用顏色區分不同分支線（lane），呈現分叉與合併的關係
 - **點擊取得 Focus**：點擊 commit 節點或旁邊的文字列，會高亮該節點，其餘 commit 自動調暗，方便聚焦觀察；點擊空白處可取消 focus
 - **Commit 詳細資訊面板**：下方面板顯示完整 hash、作者、日期、parent commit、refs、完整 commit message（含多行內容），文字可選取複製
-- **左側 Branch List**：列出本地分支，預設分支（依 origin HEAD 或 main/master）會自動排在最上面；點擊分支會標示出該分支可追溯到的所有 commit，不會重新排列 graph 版面
+- **左側 Branch List**：列出本地分支，預設分支（依 origin HEAD 或 main/master）會自動排在最上面；點擊分支會把該分支設為主線重新排版（該分支的線固定畫在最左側），標示出其可追溯到的所有 commit，並自動捲動到該分支最新的 commit；再點一次取消，主線恢復為預設分支
+- **主線可切換**：Graph 預設以偵測到的預設分支（main/master）為主線繪製，不再單純以「最新 commit」決定哪條線畫在最左側
 - **路徑記憶**：手動輸入或透過瀏覽視窗選取過的 repo 路徑會自動記住，下次開啟可直接從下拉選單選取，並自動正規化正反斜線寫法避免重複紀錄
 - **字體大小調整**：工具列可即時調整字體大小，並會記住設定，重開程式不需要再調一次
 - **WSL 路徑支援**：可直接輸入或透過瀏覽視窗開啟 `\\wsl$\...` 這類路徑
@@ -43,7 +44,7 @@ python git_graph_viewer.py C:\path\to\your\repo
 |---|---|
 | 點擊 commit 節點 / 文字 | 取得 focus，detail panel 顯示完整資訊；再點一次取消 |
 | 點擊 graph 空白處 | 取消目前的 commit focus |
-| 點擊左側分支名稱 | 標示該分支可追溯到的所有 commit；再點一次取消 |
+| 點擊左側分支名稱 | 將該分支設為主線並重新排版、標示其所有 commit，並自動捲動到最新 commit；再點一次取消，主線恢復為預設分支 |
 | 點擊 branch list 空白處 | 取消分支標示 |
 | 拖曳畫面 | 平移 graph（滑鼠左鍵拖曳） |
 | 拖曳中間分隔線 | 調整 commit detail 面板高度 |

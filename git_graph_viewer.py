@@ -110,12 +110,20 @@ LANE_COLORS = [
 ]
 
 
-def compute_layout(commits: list):
+def compute_layout(commits: list, mainline_tip_hash: Optional[str] = None):
     """為每個 commit 指定 (row, lane),回傳 commits 以及 edges 清單。
     edges: list of (parent_hash, child_hash, lane_color_index)
+
+    mainline_tip_hash: 若指定，會先把 lane 0 保留給這個 commit，讓它沿著
+    first-parent chain 一路占住 lane 0，其餘分支自動被推到別的 lane。
+    不指定時維持舊行為：誰在 commits 清單裡最先出現（也就是最新的
+    commit）就先搶到 lane 0。
     """
     hash_to_commit = {c.chash: c for c in commits}
-    active_lanes: list = []  # each slot: expected commit hash or None
+    if mainline_tip_hash and mainline_tip_hash in hash_to_commit:
+        active_lanes: list = [mainline_tip_hash]  # 預先保留 lane 0 給主線分支
+    else:
+        active_lanes = []  # each slot: expected commit hash or None
     edges = []
 
     for row, c in enumerate(commits):
@@ -272,6 +280,17 @@ def local_branch_names(repo_path: str) -> list:
     return names
 
 
+def branch_tip_hash(repo_path: str, branch_name: str) -> Optional[str]:
+    """取得某分支 tip 的 commit hash，用來當作主線繪圖的起點。"""
+    result = run_git(
+        ["git", "-C", repo_path, "rev-parse", branch_name],
+        encoding="utf-8", errors="replace"
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def branch_ancestor_hashes(repo_path: str, branch_name: str) -> set:
     """取得某分支可追溯到的所有 commit hash 集合（用於高亮標示）。"""
     result = run_git(
@@ -324,6 +343,12 @@ class GitGraphView(QGraphicsView):
 
     def set_detail_panel(self, panel: QTextEdit):
         self.detail_panel = panel
+
+    def scroll_to_commit(self, commit_hash: str):
+        """把畫面捲動到指定 commit 節點所在位置（置中顯示）。"""
+        items = self.commit_items.get(commit_hash)
+        if items:
+            self.centerOn(items["node"])
 
     def clear(self):
         self.scene_.clear()
@@ -634,6 +659,9 @@ class MainWindow(QMainWindow):
         self.branch_list.itemClicked.connect(self.on_branch_clicked)
         self.branch_list.emptyClicked.connect(self.clear_branch_selection)
         self.selected_branch_name: Optional[str] = None
+        self.default_branch_name: Optional[str] = None  # main/master，重設主線時的預設值
+        self.mainline_branch: Optional[str] = None       # 目前畫圖用的主線分支
+        self.raw_commits: Optional[list] = None          # compute_layout 前的原始 commit 清單，換主線時免重讀 git log
 
         branch_dock = QDockWidget("Branches", self)
         branch_dock.setWidget(self.branch_list)
@@ -750,27 +778,46 @@ class MainWindow(QMainWindow):
                 self.view.branch_highlight_hashes = prev_branch_hashes
                 self.view.apply_focus_style()
 
+    def _relayout(self, mainline_branch: Optional[str]):
+        """用 self.raw_commits（已讀好的原始 commit 清單）重新計算 lane/主線並重畫，
+        不必重讀 git log。重畫後會呼叫 render_commits()，任何 focus/高亮狀態需由
+        呼叫端在這之後自行還原。"""
+        if self.raw_commits is None:
+            return None
+        tip_hash = branch_tip_hash(self.repo_path, mainline_branch) if mainline_branch else None
+        commits, edges, hash_to_commit = compute_layout(self.raw_commits, mainline_tip_hash=tip_hash)
+        max_lanes = max((c.lane for c in commits), default=0)
+        self.view.render_commits(commits, edges, hash_to_commit, max_lanes)
+        self.last_render_data = (commits, edges, hash_to_commit, max_lanes)
+        self.mainline_branch = mainline_branch
+        return tip_hash
+
     def clear_branch_selection(self):
         if self.selected_branch_name is None:
             return
         self.selected_branch_name = None
         self.branch_list.clearSelection()
+        self._relayout(self.default_branch_name)
         self.view.clear_branch_highlight()
-        self.status.showMessage("已取消分支高亮")
+        self.status.showMessage("已取消分支高亮，主線恢復為預設分支")
 
     def on_branch_clicked(self, item: QListWidgetItem):
         name = item.text()
         if self.selected_branch_name == name:
-            # 再點一次同一個分支 -> 取消高亮
+            # 再點一次同一個分支 -> 取消高亮，主線恢復為預設分支
             self.selected_branch_name = None
             self.branch_list.clearSelection()
+            self._relayout(self.default_branch_name)
             self.view.clear_branch_highlight()
-            self.status.showMessage("已取消分支高亮")
+            self.status.showMessage("已取消分支高亮，主線恢復為預設分支")
             return
         self.selected_branch_name = name
+        tip_hash = self._relayout(name)
         hashes = branch_ancestor_hashes(self.repo_path, name)
         self.view.set_branch_highlight(hashes)
-        self.status.showMessage(f"已標示分支 '{name}' 的 {len(hashes)} 個 commits")
+        if tip_hash:
+            self.view.scroll_to_commit(tip_hash)
+        self.status.showMessage(f"已將 '{name}' 設為主線，並標示其 {len(hashes)} 個 commits")
 
     def refresh(self, _retry_after_fix: bool = False):
         path = self.path_combo.currentText().strip()
@@ -783,14 +830,21 @@ class MainWindow(QMainWindow):
                 self.status.showMessage("找不到任何 commit")
                 self.view.clear()
                 return
-            commits, edges, hash_to_commit = compute_layout(commits)
+            self.raw_commits = commits
+            branch_names = local_branch_names(path)
+            self.default_branch_name = get_default_branch_name(path, branch_names) or (
+                branch_names[0] if branch_names else None
+            )
+            self.mainline_branch = self.default_branch_name
+            tip_hash = branch_tip_hash(path, self.mainline_branch) if self.mainline_branch else None
+            commits, edges, hash_to_commit = compute_layout(commits, mainline_tip_hash=tip_hash)
             max_lanes = max((c.lane for c in commits), default=0)
             self.view.render_commits(commits, edges, hash_to_commit, max_lanes)
             self.last_render_data = (commits, edges, hash_to_commit, max_lanes)
 
             self.branch_list.clear()
             self.selected_branch_name = None
-            for name in local_branch_names(path):
+            for name in branch_names:
                 self.branch_list.addItem(QListWidgetItem(name))
 
             self.status.showMessage(f"已載入 {len(commits)} 個 commits — {path}")
