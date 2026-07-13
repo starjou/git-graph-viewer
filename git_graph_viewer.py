@@ -26,6 +26,22 @@ from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
 
 
 # ----------------------------------------------------------------------
+# subprocess 呼叫共用參數：避免用 pythonw 啟動時，每次呼叫 git 都跳出一個
+# 新的 cmd 視窗（Windows 專屬行為，其他平台無影響）。
+# ----------------------------------------------------------------------
+_SUBPROCESS_NO_WINDOW = {}
+if sys.platform == "win32":
+    _SUBPROCESS_NO_WINDOW["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+
+def run_git(cmd, **kwargs):
+    """subprocess.run 的包裝：統一補上不開視窗參數，其餘用法與 subprocess.run 相同。"""
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    return subprocess.run(cmd, **_SUBPROCESS_NO_WINDOW, **kwargs)
+
+
+# ----------------------------------------------------------------------
 # Data model
 # ----------------------------------------------------------------------
 
@@ -59,7 +75,7 @@ def load_commits(repo_path: str, branch_scope: str = "--all", limit: Optional[in
     if limit:
         cmd.insert(4, f"-{limit}")
 
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = run_git(cmd, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "git log 執行失敗")
     if result.stdout is None:
@@ -222,9 +238,9 @@ def branch_label_html(refs: str) -> str:
 def get_default_branch_name(repo_path: str, available: list) -> Optional[str]:
     """偵測 repo 的預設分支名稱。優先採用遠端 origin 設定的 HEAD 指向，
     抓不到時退而求其次找常見命名（main / master）。"""
-    result = subprocess.run(
+    result = run_git(
         ["git", "-C", repo_path, "symbolic-ref", "refs/remotes/origin/HEAD"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
+        encoding="utf-8", errors="replace"
     )
     if result.returncode == 0:
         ref = result.stdout.strip()
@@ -241,9 +257,9 @@ def get_default_branch_name(repo_path: str, available: list) -> Optional[str]:
 
 def local_branch_names(repo_path: str) -> list:
     """取得本地分支名稱清單，預設分支（main/master 或 origin HEAD 指向的分支）排在最前面。"""
-    result = subprocess.run(
+    result = run_git(
         ["git", "-C", repo_path, "branch", "--format=%(refname:short)"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
+        encoding="utf-8", errors="replace"
     )
     if result.returncode != 0:
         return []
@@ -258,9 +274,9 @@ def local_branch_names(repo_path: str) -> list:
 
 def branch_ancestor_hashes(repo_path: str, branch_name: str) -> set:
     """取得某分支可追溯到的所有 commit hash 集合（用於高亮標示）。"""
-    result = subprocess.run(
+    result = run_git(
         ["git", "-C", repo_path, "log", branch_name, "--pretty=%H"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
+        encoding="utf-8", errors="replace"
     )
     if result.returncode != 0:
         return set()
@@ -291,15 +307,15 @@ class GitGraphView(QGraphicsView):
         self.font_size = 9  # 可由 MainWindow 的字體大小控制調整
 
     def mousePressEvent(self, event):
-        self._press_pos = event.pos()
+        self._press_pos = event.position().toPoint()
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         if self._press_pos is not None:
-            moved = (event.pos() - self._press_pos).manhattanLength()
+            moved = (event.position().toPoint() - self._press_pos).manhattanLength()
             if moved < 4:  # 視為「點擊」而非拖曳平移
-                item = self.itemAt(event.pos())
+                item = self.itemAt(event.position().toPoint())
                 if not isinstance(item, (CommitNodeItem, CommitTextItem)) and self.focused_hash is not None:
                     self.focused_hash = None
                     self.apply_focus_style()
@@ -568,7 +584,7 @@ class BranchListWidget(QListWidget):
     emptyClicked = Signal()
 
     def mousePressEvent(self, event):
-        item = self.itemAt(event.pos())
+        item = self.itemAt(event.position().toPoint())
         super().mousePressEvent(event)
         if item is None:
             self.emptyClicked.emit()
@@ -806,9 +822,8 @@ class MainWindow(QMainWindow):
         )
         if not agreed:
             return False
-        result = subprocess.run(
-            ["git", "config", "--global", "--add", "safe.directory", safe_value],
-            capture_output=True, text=True
+        result = run_git(
+            ["git", "config", "--global", "--add", "safe.directory", safe_value]
         )
         if result.returncode != 0:
             show_error_dialog(self, "設定失敗", result.stderr.strip() or "git config 執行失敗")
