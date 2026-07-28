@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
     QGraphicsLineItem, QGraphicsTextItem, QGraphicsPathItem, QGraphicsRectItem,
     QMessageBox, QStatusBar, QDockWidget, QListWidget, QListWidgetItem,
     QTextEdit, QSplitter, QSpinBox, QToolButton, QMenu, QDialog, QFormLayout,
-    QInputDialog, QTabBar, QWidget, QVBoxLayout, QHBoxLayout, QWidgetAction
+    QInputDialog, QTabBar, QWidget, QVBoxLayout, QHBoxLayout, QWidgetAction,
+    QCheckBox
 )
 from PySide6.QtGui import QColor, QPen, QBrush, QFont, QPainterPath, QAction
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
@@ -111,6 +112,20 @@ LANE_COLORS = [
 ]
 
 
+def _nearest_free_lane(active_lanes: list, anchor: Optional[int]) -> Optional[int]:
+    """在 active_lanes 裡找一個空的 lane index，優先挑離 anchor 最近的；
+    anchor 是 None 時退化成「第一個找到的空 lane」。找不到回傳 None（呼叫端自行 append）。"""
+    best_i = None
+    best_dist = None
+    for i, expected in enumerate(active_lanes):
+        if expected is None:
+            dist = abs(i - anchor) if anchor is not None else i
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_i = i
+    return best_i
+
+
 def compute_layout(commits: list, mainline_tip_hash: Optional[str] = None):
     """為每個 commit 指定 (row, lane),回傳 commits 以及 edges 清單。
     edges: list of (parent_hash, child_hash, lane_color_index)
@@ -126,6 +141,9 @@ def compute_layout(commits: list, mainline_tip_hash: Optional[str] = None):
     else:
         active_lanes = []  # each slot: expected commit hash or None
     edges = []
+    # merge 的第二個 parent 先不佔 lane，只記在這裡：hash -> 期望靠近的 lane index。
+    # 等 topo-order 真的走到那個 commit 時，才拿這個提示去挑最近的空 lane。
+    pending_hint: dict = {}
 
     for row, c in enumerate(commits):
         c.row = row
@@ -137,15 +155,16 @@ def compute_layout(commits: list, mainline_tip_hash: Optional[str] = None):
                 lane_idx = i
                 break
         if lane_idx is None:
-            # not reserved by anyone -> new root-ish branch tip, find free slot or append
-            lane_idx = None
-            for i, expected in enumerate(active_lanes):
-                if expected is None:
-                    lane_idx = i
-                    break
+            # 沒有任何 lane 在等這個 commit，需要現場分配一條。
+            # 若之前某個 merge 替它留過提示（它是那個 merge 的第二個 parent），
+            # 就挑離提示最近的空 lane，讓它盡量長在合併對象旁邊。
+            anchor = pending_hint.pop(c.chash, None)
+            lane_idx = _nearest_free_lane(active_lanes, anchor)
             if lane_idx is None:
                 lane_idx = len(active_lanes)
                 active_lanes.append(None)
+        else:
+            pending_hint.pop(c.chash, None)  # 已經有 lane 在等它了，提示用不到
 
         c.lane = lane_idx
 
@@ -162,19 +181,30 @@ def compute_layout(commits: list, mainline_tip_hash: Optional[str] = None):
             # first parent continues in the same lane
             active_lanes[lane_idx] = parents[0]
             edges.append((parents[0], c.chash, lane_idx))
-            # additional parents (merges) get their own lane
+            # additional parents (merges)
             for p in parents[1:]:
-                # reuse a free lane if available, else create one
-                p_lane = None
+                # 如果這個 parent 已經有別的 active lane 在等它了（例如它是條長期
+                # 存活、目前仍持續前進的分支，如 develop），就不要再另外硬塞一個
+                # 新 lane 蓋過去——那樣只會製造一筆多餘的重複保留，之後真正處理到
+                # 這個 commit 時，兩筆保留其中一筆會被清掉，很可能反而把它原本
+                # 正確的 lane 位置洗掉、變成畫在別的地方。直接沿用既有的 lane 即可。
+                existing_lane = None
                 for i, expected in enumerate(active_lanes):
-                    if expected is None:
-                        p_lane = i
+                    if expected == p:
+                        existing_lane = i
                         break
-                if p_lane is None:
-                    p_lane = len(active_lanes)
-                    active_lanes.append(None)
-                active_lanes[p_lane] = p
-                edges.append((p, c.chash, p_lane))
+                if existing_lane is not None:
+                    edges.append((p, c.chash, existing_lane))
+                    continue
+                # 沒有既有保留時，這裡「不」立刻替它佔一條 lane。
+                # 在 topo-order 下，這個 parent 往往排在很後面（可能差上百 row），
+                # 若現在就預訂，那條 lane 從預訂到真正被使用之間會長期閒置又不能
+                # 釋放，lane index 就被一路往右 append，畫出橫跨整張圖的大弧線。
+                # 改成只留一個「將來請長在這附近」的提示，等真的走到它再分配。
+                pending_hint.setdefault(p, lane_idx)
+                # edge 的位置只由 child.lane / parent.lane 決定，這裡的 lane index
+                # 僅用來選線的顏色，沿用 merge commit 自己的 lane 即可。
+                edges.append((p, c.chash, lane_idx))
 
     return commits, edges, hash_to_commit
 
@@ -309,6 +339,19 @@ def remote_branch_names(repo_path: str, remote: str) -> list:
         if line.startswith(prefix):
             names.append(line[len(prefix):])
     return names
+
+
+def merged_ref_names(repo_path: str, target_branch: str) -> set:
+    """取得（本地 + 各 remote）已經合併進 target_branch 的分支 short name 集合，
+    用來判斷 branch list 裡哪些項目已經合併過。"""
+    result = run_git(
+        ["git", "-C", repo_path, "branch", "--all", "--merged", target_branch,
+         "--format=%(refname:short)"],
+        encoding="utf-8", errors="replace"
+    )
+    if result.returncode != 0:
+        return set()
+    return set(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
 def branch_tip_hash(repo_path: str, branch_name: str) -> Optional[str]:
@@ -750,12 +793,28 @@ class MainWindow(QMainWindow):
         self.default_branch_name: Optional[str] = None  # main/master，重設主線時的預設值
         self.mainline_branch: Optional[str] = None       # 目前畫圖用的主線分支
         self.raw_commits: Optional[list] = None          # compute_layout 前的原始 commit 清單，換主線時免重讀 git log
+        self.merged_ref_names: set = set()               # 已合併進預設分支的 branch short name 集合
+
+        self.show_all_checkbox = QCheckBox("All")
+        self.show_all_checkbox.setStyleSheet(
+            "QCheckBox { color: #aaaaaa; padding: 0px 10px; background-color: #2b2b2b; }"
+        )
+        self.show_all_checkbox.stateChanged.connect(self._on_show_all_toggled)
+        self.show_all_checkbox.setVisible(False)  # 還沒載入 repo 時不顯示
+
+        tab_row = QWidget()
+        tab_row.setStyleSheet("background-color: #2b2b2b;")
+        tab_row_layout = QHBoxLayout(tab_row)
+        tab_row_layout.setContentsMargins(0, 0, 0, 0)
+        tab_row_layout.setSpacing(0)
+        tab_row_layout.addWidget(self.branch_tab_bar, 1)
+        tab_row_layout.addWidget(self.show_all_checkbox)
 
         branch_panel = QWidget()
         branch_panel_layout = QVBoxLayout(branch_panel)
         branch_panel_layout.setContentsMargins(0, 0, 0, 0)
         branch_panel_layout.setSpacing(0)
-        branch_panel_layout.addWidget(self.branch_tab_bar)
+        branch_panel_layout.addWidget(tab_row)
         branch_panel_layout.addWidget(self.branch_list)
 
         branch_dock = QDockWidget("Branches", self)
@@ -1067,16 +1126,29 @@ class MainWindow(QMainWindow):
         self.branch_tab_bar.blockSignals(False)
 
         self.branch_tab_bar.setCurrentIndex(0)
+        self.show_all_checkbox.setVisible(True)
         self._populate_branch_list("local")
         self._update_fetch_button_visibility("local")
 
     def _populate_branch_list(self, tab_key: str):
         self.branch_list.clear()
         self.selected_branch_name = None
+        show_all = self.show_all_checkbox.isChecked()
         for display_name, full_ref in self.branch_tab_data.get(tab_key, []):
+            is_main = display_name == self.default_branch_name
+            is_merged = full_ref in self.merged_ref_names
+            if not show_all and is_merged and not is_main:
+                continue  # 預設只顯示還沒合併到主分支的 branch；主分支永遠顯示
             item = QListWidgetItem(display_name)
             item.setData(Qt.UserRole, full_ref)
+            if show_all and is_merged and not is_main:
+                item.setForeground(QBrush(QColor("#888888")))  # 已合併，亮度降低；主分支不降低
             self.branch_list.addItem(item)
+
+    def _on_show_all_toggled(self, _state):
+        index = self.branch_tab_bar.currentIndex()
+        if 0 <= index < len(self.branch_tab_order):
+            self._populate_branch_list(self.branch_tab_order[index])
 
     def _update_fetch_button_visibility(self, active_key: str):
         """只有目前被選到的 remote tab 顯示它自己的 fetch 按鈕。"""
@@ -1126,6 +1198,8 @@ class MainWindow(QMainWindow):
         self.selected_branch_name = None
         self.default_branch_name = None
         self.mainline_branch = None
+        self.merged_ref_names = set()
+        self.show_all_checkbox.setVisible(False)
 
     def refresh(self, path: Optional[str] = None, _retry_after_fix: bool = False):
         if path is None:
@@ -1150,6 +1224,9 @@ class MainWindow(QMainWindow):
                 branch_names[0] if branch_names else None
             )
             self.mainline_branch = self.default_branch_name
+            self.merged_ref_names = (
+                merged_ref_names(path, self.default_branch_name) if self.default_branch_name else set()
+            )
             tip_hash = branch_tip_hash(path, self.mainline_branch) if self.mainline_branch else None
             commits, edges, hash_to_commit = compute_layout(commits, mainline_tip_hash=tip_hash)
             max_lanes = max((c.lane for c in commits), default=0)
@@ -1158,9 +1235,11 @@ class MainWindow(QMainWindow):
 
             tab_data = {"local": [(n, n) for n in branch_names]}
             for remote in list_remote_names(path):
-                tab_data[remote] = [
-                    (n, f"{remote}/{n}") for n in remote_branch_names(path, remote)
-                ]
+                remote_names = remote_branch_names(path, remote)
+                if self.default_branch_name and self.default_branch_name in remote_names:
+                    remote_names.remove(self.default_branch_name)
+                    remote_names.insert(0, self.default_branch_name)
+                tab_data[remote] = [(n, f"{remote}/{n}") for n in remote_names]
             self._rebuild_branch_tabs(tab_data)
 
             self.status.showMessage(f"已載入 {len(commits)} 個 commits — {path}")

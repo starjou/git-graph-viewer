@@ -4,11 +4,12 @@
 
 ## 功能特色
 
-- **Commit Graph 視覺化**：用顏色區分不同分支線（lane），呈現分叉與合併的關係
+- **Commit Graph 視覺化**：用顏色區分不同分支線（lane），呈現分叉與合併的關係。分支線採延遲配置，只有在該分支真正出現 commit 時才佔用一條線，因此即使是分支眾多的共用 repo，畫面也能維持緊湊，不會被大量閒置的線撐開
 - **點擊取得 Focus**：點擊 commit 節點或旁邊的文字列，會高亮該節點，其餘 commit 自動調暗，方便聚焦觀察；點擊空白處可取消 focus
 - **Commit 詳細資訊面板**：下方面板顯示完整 hash、作者、日期、parent commit、refs、完整 commit message（含多行內容），文字可選取複製
 - **Branch List 依 local/remote 分頁顯示**：左側分支清單上方有 tab bar，`local` 顯示本地分支，其餘每個 remote（如 `origin`）各自一個分頁，互不混雜；點擊分支會把該分支設為主線重新排版（該分支的線固定畫在最左側），標示出其可追溯到的所有 commit，並自動捲動到該分支最新的 commit；再點一次取消，主線恢復為預設分支
 - **單一 remote 一鍵 Fetch**：切到某個 remote 分頁時，分頁上會顯示一個 fetch 圖示，點擊只會 `git fetch <該 remote> --prune`，不會動到其他 remote，抓完自動重新整理並停留在同一分頁
+- **只看還沒合併的分支**：分頁列右側有一個 `All` 核取方塊，預設不勾選，此時只列出「尚未合併進預設分支」的分支（預設分支本身一律顯示），讓待處理的分支一目了然；勾選後會列出全部分支，其中已合併的會以較暗的顏色標示以便區分
 - **主線可切換**：Graph 預設以偵測到的預設分支（main/master）為主線繪製，不再單純以「最新 commit」決定哪條線畫在最左側
 - **Repositories 選單**：工具列的「Repositories」選單整合了開啟 repo 的所有方式——瀏覽資料夾（Open Repo...）、手動輸入/貼上路徑（Type Path...）、最近開啟清單（Open Recently，項目可 hover 顯示刪除按鈕移除單筆紀錄），以及設定（Settings...，目前提供字體大小）
 - **路徑記憶**：開啟過的 repo 路徑會自動記住並正規化正反斜線寫法避免重複紀錄，可從 Open Recently 隨時切換；目前路徑會顯示在唯讀的路徑欄位，旁邊有重新整理與複製路徑按鈕
@@ -47,6 +48,7 @@ python git_graph_viewer.py C:\path\to\your\repo
 | 點擊 commit 節點 / 文字 | 取得 focus，detail panel 顯示完整資訊；再點一次取消 |
 | 點擊 graph 空白處 | 取消目前的 commit focus |
 | 切換 local/remote 分頁 | 分開檢視本地分支與各 remote 的分支，不互相混雜 |
+| 勾選 / 取消分頁列的 `All` | 取消勾選只列出尚未合併進預設分支的分支；勾選則列出全部，已合併的以較暗顏色標示 |
 | 點擊左側分支名稱 | 將該分支設為主線並重新排版、標示其所有 commit，並自動捲動到最新 commit；再點一次取消，主線恢復為預設分支 |
 | 點擊 branch list 空白處 | 取消分支標示 |
 | 點擊 remote 分頁上的 fetch 圖示 | 只 fetch 該 remote（`git fetch <remote> --prune`），完成後自動重新整理 |
