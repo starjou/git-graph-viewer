@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
     QFileDialog, QToolBar, QLineEdit, QLabel, QGraphicsEllipseItem,
     QGraphicsLineItem, QGraphicsTextItem, QGraphicsPathItem, QGraphicsRectItem,
     QMessageBox, QStatusBar, QDockWidget, QListWidget, QListWidgetItem,
-    QTextEdit, QSplitter, QComboBox, QSpinBox
+    QTextEdit, QSplitter, QSpinBox, QToolButton, QMenu, QDialog, QFormLayout,
+    QInputDialog, QTabBar, QWidget, QVBoxLayout, QHBoxLayout, QWidgetAction
 )
 from PySide6.QtGui import QColor, QPen, QBrush, QFont, QPainterPath, QAction
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QTimer
@@ -277,6 +278,36 @@ def local_branch_names(repo_path: str) -> list:
     if default_name and default_name in names:
         names.remove(default_name)
         names.insert(0, default_name)
+    return names
+
+
+def list_remote_names(repo_path: str) -> list:
+    """取得這個 repo 設定的所有 remote 名稱（如 origin、hub）。"""
+    result = run_git(
+        ["git", "-C", repo_path, "remote"],
+        encoding="utf-8", errors="replace"
+    )
+    if result.returncode != 0:
+        return []
+    return [r.strip() for r in result.stdout.splitlines() if r.strip()]
+
+
+def remote_branch_names(repo_path: str, remote: str) -> list:
+    """取得某個 remote 底下的分支名稱清單（不含 remote 前綴，也濾掉 HEAD 指標）。"""
+    result = run_git(
+        ["git", "-C", repo_path, "for-each-ref", "--format=%(refname:short)", f"refs/remotes/{remote}"],
+        encoding="utf-8", errors="replace"
+    )
+    if result.returncode != 0:
+        return []
+    prefix = f"{remote}/"
+    names = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line == f"{remote}/HEAD":
+            continue
+        if line.startswith(prefix):
+            names.append(line[len(prefix):])
     return names
 
 
@@ -615,6 +646,51 @@ class BranchListWidget(QListWidget):
             self.emptyClicked.emit()
 
 
+class RecentPathRow(QWidget):
+    """Open Recently 選單裡的一列：滑鼠移過去時右邊會浮現刪除按鈕，
+    點列本身（刪除按鈕以外的地方）會開啟該路徑。"""
+    open_requested = Signal(str)
+    remove_requested = Signal(str)
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.setMouseTracking(True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 6, 4)
+        layout.setSpacing(6)
+
+        label = QLabel(path)
+        label.setStyleSheet("color: #ffffff;")
+        layout.addWidget(label, 1)
+
+        self.delete_btn = QToolButton()
+        self.delete_btn.setText("✕")
+        self.delete_btn.setCursor(Qt.PointingHandCursor)
+        self.delete_btn.setToolTip("Remove")
+        self.delete_btn.setStyleSheet(
+            "QToolButton { color: #cc7777; border: none; padding: 0px 4px; }"
+            "QToolButton:hover { color: #ff5555; }"
+        )
+        self.delete_btn.setVisible(False)
+        self.delete_btn.clicked.connect(lambda: self.remove_requested.emit(self.path))
+        layout.addWidget(self.delete_btn)
+
+    def enterEvent(self, event):
+        self.delete_btn.setVisible(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.delete_btn.setVisible(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if not self.delete_btn.underMouse():
+            self.open_requested.emit(self.path)
+        super().mousePressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, repo_path: Optional[str] = None):
         super().__init__()
@@ -649,7 +725,19 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         self._splitter = splitter
 
-        # 左側 branch list
+        # 左側 branch list，上面加一個 tab bar 依 local/remote 分開顯示
+        self.branch_tab_bar = QTabBar()
+        self.branch_tab_bar.setStyleSheet(
+            "QTabBar { background-color: #2b2b2b; }"
+            "QTabBar::tab { background-color: #2b2b2b; color: #aaaaaa; "
+            "padding: 6px 14px; }"
+            "QTabBar::tab:selected { background-color: #3a3a3a; color: #ffffff; }"
+            "QTabBar::tab:hover { color: #ffffff; }"
+        )
+        self.branch_tab_bar.currentChanged.connect(self._on_branch_tab_changed)
+        self.branch_tab_order: list = []          # tab index -> tab key（"local" 或 remote 名稱）
+        self.branch_tab_data: dict = {}           # tab key -> [(display_name, full_ref_name), ...]
+
         self.branch_list = BranchListWidget()
         self.branch_list.setStyleSheet(
             "QListWidget { background-color: #2b2b2b; color: #dddddd; border: none; }"
@@ -663,8 +751,15 @@ class MainWindow(QMainWindow):
         self.mainline_branch: Optional[str] = None       # 目前畫圖用的主線分支
         self.raw_commits: Optional[list] = None          # compute_layout 前的原始 commit 清單，換主線時免重讀 git log
 
+        branch_panel = QWidget()
+        branch_panel_layout = QVBoxLayout(branch_panel)
+        branch_panel_layout.setContentsMargins(0, 0, 0, 0)
+        branch_panel_layout.setSpacing(0)
+        branch_panel_layout.addWidget(self.branch_tab_bar)
+        branch_panel_layout.addWidget(self.branch_list)
+
         branch_dock = QDockWidget("Branches", self)
-        branch_dock.setWidget(self.branch_list)
+        branch_dock.setWidget(branch_panel)
         # 固定停靠，不可拖曳浮動、不可關閉，避開 Qt6 浮動視窗的邊角問題
         branch_dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         # 移除標題列（含拖曳/浮動/關閉按鈕），改用一個空白 widget 取代，
@@ -689,33 +784,75 @@ class MainWindow(QMainWindow):
         )
         self.addToolBar(toolbar)
 
-        open_action = QAction("開啟 Repo...", self)
-        open_action.triggered.connect(self.open_repo_dialog)
-        toolbar.addAction(open_action)
-        toolbar.widgetForAction(open_action).setCursor(Qt.PointingHandCursor)
-
-        refresh_action = QAction("重新整理", self)
-        refresh_action.triggered.connect(self.refresh)
-        toolbar.addAction(refresh_action)
-        toolbar.widgetForAction(refresh_action).setCursor(Qt.PointingHandCursor)
-
-        toolbar.addWidget(QLabel("  Path: "))
-        self.path_combo = QComboBox()
-        self.path_combo.setEditable(True)
-        self.path_combo.setMinimumWidth(420)
-        self.path_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.path_combo.addItems(load_recent_paths())
-        self.path_combo.lineEdit().returnPressed.connect(self.refresh)
-        self.path_combo.activated.connect(lambda _i: self.refresh())
-        self.path_combo.setStyleSheet(
-            "QComboBox { background-color: #1e1e1e; color: #ffffff; "
-            "border: 1px solid #555; padding: 2px 4px; }"
-            "QComboBox QAbstractItemView { background-color: #1e1e1e; color: #ffffff; "
-            "selection-background-color: #3a6ea5; }"
+        menu_button = QToolButton()
+        menu_button.setText("Repositories")
+        menu_button.setPopupMode(QToolButton.InstantPopup)
+        menu_button.setCursor(Qt.PointingHandCursor)
+        menu_button.setStyleSheet(
+            "QToolButton::menu-indicator { image: none; width: 0px; }"
         )
-        toolbar.addWidget(self.path_combo)
 
-        toolbar.addWidget(QLabel("  字體: "))
+        main_menu = QMenu(menu_button)
+        self.main_menu = main_menu
+        main_menu.setStyleSheet(
+            "QMenu { background-color: #2b2b2b; color: #ffffff; border: 1px solid #555; }"
+            "QMenu::item:selected { background-color: #3a6ea5; }"
+            "QMenu::item:disabled { color: #888888; }"
+        )
+
+        open_action = QAction("Open Repo...", self)
+        open_action.triggered.connect(self.open_repo_dialog)
+        main_menu.addAction(open_action)
+
+        type_path_action = QAction("Type Path...", self)
+        type_path_action.triggered.connect(self.open_type_path_dialog)
+        main_menu.addAction(type_path_action)
+
+        self.recent_menu = QMenu("Open Recently", main_menu)
+        self.recent_menu.setStyleSheet(main_menu.styleSheet())
+        main_menu.addMenu(self.recent_menu)
+        self._refresh_recent_menu()
+
+        main_menu.addSeparator()
+
+        settings_action = QAction("Settings...", self)
+        settings_action.triggered.connect(self.open_settings_dialog)
+        main_menu.addAction(settings_action)
+
+        menu_button.setMenu(main_menu)
+        toolbar.addWidget(menu_button)
+
+        self.path_display = QLineEdit()
+        self.path_display.setReadOnly(True)
+        self.path_display.setMinimumWidth(420)
+        self.path_display.setStyleSheet(
+            "QLineEdit { background-color: #1e1e1e; color: #cccccc; "
+            "border: 1px solid #555; padding: 2px 4px; }"
+        )
+        toolbar.addWidget(self.path_display)
+
+        refresh_button = QToolButton()
+        refresh_button.setText("⟳")
+        refresh_button.setToolTip("重新整理")
+        refresh_button.setCursor(Qt.PointingHandCursor)
+        refresh_button.setFixedSize(32, 32)
+        refresh_button.setStyleSheet(
+            "QToolButton { font-size: 18pt; padding: 0px 0px 6px 0px; }"
+        )
+        refresh_button.clicked.connect(lambda: self.refresh())
+        toolbar.addWidget(refresh_button)
+
+        copy_button = QToolButton()
+        copy_button.setText("📋")
+        copy_button.setToolTip("Copy Path")
+        copy_button.setCursor(Qt.PointingHandCursor)
+        copy_button.setFixedSize(32, 32)
+        copy_button.setStyleSheet(
+            "QToolButton { font-size: 14pt; padding: 0px; }"
+        )
+        copy_button.clicked.connect(self.copy_path_to_clipboard)
+        toolbar.addWidget(copy_button)
+
         self.last_render_data = None  # (commits, edges, hash_to_commit, max_lanes)，供調整字體時免重新讀 git log
         self.font_size_spin = QSpinBox()
         self.font_size_spin.setRange(7, 24)
@@ -725,13 +862,13 @@ class MainWindow(QMainWindow):
             "border: 1px solid #555; padding: 2px 4px; }"
         )
         self.font_size_spin.valueChanged.connect(self.on_font_size_changed)
-        toolbar.addWidget(self.font_size_spin)
         self.on_font_size_changed(self.font_size_spin.value())  # 套用到 view 上（此時還沒有 commit 資料，安全）
+        self._build_settings_dialog()
 
         self.repo_path = repo_path
         if repo_path:
-            self.path_combo.setEditText(repo_path)
-            self.refresh()
+            self.path_display.setText(repo_path)
+            self.refresh(repo_path)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -748,8 +885,105 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             selected = dlg.selectedFiles()
             if selected:
-                self.path_combo.setEditText(selected[0])
-                self.refresh()
+                self._open_path(selected[0])
+
+    def open_type_path_dialog(self):
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("Type Path")
+        dlg.setLabelText("Repository path:")
+        dlg.setTextValue(self.repo_path or "")
+        dlg.resize(560, dlg.height())
+        dlg.setStyleSheet(
+            "QDialog { background-color: #2b2b2b; }"
+            "QLabel { color: #ffffff; }"
+            "QLineEdit { background-color: #1e1e1e; color: #ffffff; "
+            "border: 1px solid #555; padding: 4px; }"
+            "QPushButton { background-color: #3a3a3a; color: #ffffff; "
+            "border: 1px solid #555; padding: 4px 14px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #4a4a4a; }"
+        )
+        if dlg.exec() and dlg.textValue().strip():
+            self._open_path(dlg.textValue().strip())
+
+    def _open_path(self, path: str):
+        self.path_display.setText(path)
+        self.refresh(path)
+
+    def copy_path_to_clipboard(self):
+        if self.repo_path:
+            QApplication.clipboard().setText(self.repo_path)
+            self.status.showMessage("Path copied to clipboard")
+
+    def fetch_remote(self, remote: str):
+        if not self.repo_path:
+            return
+        button = self.sender()
+        if isinstance(button, QToolButton):
+            button.setEnabled(False)
+        self.status.showMessage(f"Fetching {remote}...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            result = run_git(
+                ["git", "-C", self.repo_path, "fetch", remote, "--prune"],
+                encoding="utf-8", errors="replace"
+            )
+            if result.returncode != 0:
+                show_error_dialog(self, f"Fetch {remote} failed", result.stderr.strip() or "git fetch 執行失敗")
+                self.status.showMessage(f"Fetch {remote} failed")
+                return
+        finally:
+            QApplication.restoreOverrideCursor()
+            if isinstance(button, QToolButton):
+                button.setEnabled(True)
+        self.refresh()
+        # refresh() 重建 tabs 後預設切回 local，這裡切回原本正在看的 remote tab
+        if remote in self.branch_tab_order:
+            self.branch_tab_bar.setCurrentIndex(self.branch_tab_order.index(remote))
+
+    def _refresh_recent_menu(self):
+        self.recent_menu.clear()
+        recent = load_recent_paths()
+        if not recent:
+            empty_action = QAction("(No recent paths)", self)
+            empty_action.setEnabled(False)
+            self.recent_menu.addAction(empty_action)
+            return
+        for p in recent:
+            row = RecentPathRow(p, self.recent_menu)
+            row.open_requested.connect(self._open_recent_path)
+            row.remove_requested.connect(self._remove_recent_path)
+            action = QWidgetAction(self.recent_menu)
+            action.setDefaultWidget(row)
+            self.recent_menu.addAction(action)
+
+    def _open_recent_path(self, path: str):
+        self.main_menu.close()
+        self._open_path(path)
+
+    def _remove_recent_path(self, path: str):
+        recent = load_recent_paths()
+        norm = normalize_path(path)
+        if norm in recent:
+            recent.remove(norm)
+            save_recent_paths(recent)
+        self._refresh_recent_menu()
+
+    def _build_settings_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.setStyleSheet(
+            "QDialog { background-color: #2b2b2b; color: #ffffff; }"
+            "QLabel { color: #ffffff; }"
+        )
+        layout = QFormLayout(dlg)
+        layout.addRow("Font Size:", self.font_size_spin)
+        self.settings_dialog = dlg
+
+    def open_settings_dialog(self):
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
 
     def on_font_size_changed(self, value: int):
         self.view.font_size = value
@@ -801,8 +1035,65 @@ class MainWindow(QMainWindow):
         self.view.clear_branch_highlight()
         self.status.showMessage("已取消分支高亮，主線恢復為預設分支")
 
+    def _rebuild_branch_tabs(self, tab_data: dict):
+        """依 tab_data 重建 tab bar（第一個永遠是 local，其餘照 remote 出現順序），
+        並自動切到第一個 tab、填入對應的分支清單。每個 remote tab 右側會內嵌一個
+        小 fetch 按鈕，只 fetch 那個 remote 自己，不是全域 fetch --all。"""
+        self.branch_tab_data = tab_data
+        order = ["local"] + [k for k in tab_data.keys() if k != "local"]
+        self.branch_tab_order = order
+
+        self._remote_fetch_buttons = {}  # tab key -> 內嵌在該 tab 上的 fetch 按鈕，只在該 tab 被選到時顯示
+        self.branch_tab_bar.blockSignals(True)
+        while self.branch_tab_bar.count() > 0:
+            self.branch_tab_bar.removeTab(0)
+        for idx, key in enumerate(order):
+            self.branch_tab_bar.addTab(key)
+            if key != "local":
+                fetch_btn = QToolButton()
+                fetch_btn.setText("⭳")
+                fetch_btn.setCursor(Qt.PointingHandCursor)
+                fetch_btn.setFixedSize(18, 18)
+                fetch_btn.setToolTip(f"Fetch {key} (git fetch {key} --prune)")
+                fetch_btn.setStyleSheet(
+                    "QToolButton { background-color: transparent; color: #aaaaaa; "
+                    "font-size: 10pt; border: none; padding: 0px; }"
+                    "QToolButton:hover { color: #ffffff; }"
+                )
+                fetch_btn.clicked.connect(lambda checked=False, remote=key: self.fetch_remote(remote))
+                fetch_btn.setVisible(False)
+                self.branch_tab_bar.setTabButton(idx, QTabBar.RightSide, fetch_btn)
+                self._remote_fetch_buttons[key] = fetch_btn
+        self.branch_tab_bar.blockSignals(False)
+
+        self.branch_tab_bar.setCurrentIndex(0)
+        self._populate_branch_list("local")
+        self._update_fetch_button_visibility("local")
+
+    def _populate_branch_list(self, tab_key: str):
+        self.branch_list.clear()
+        self.selected_branch_name = None
+        for display_name, full_ref in self.branch_tab_data.get(tab_key, []):
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.UserRole, full_ref)
+            self.branch_list.addItem(item)
+
+    def _update_fetch_button_visibility(self, active_key: str):
+        """只有目前被選到的 remote tab 顯示它自己的 fetch 按鈕。"""
+        for key, btn in self._remote_fetch_buttons.items():
+            btn.setVisible(key == active_key)
+
+    def _on_branch_tab_changed(self, index: int):
+        if not (0 <= index < len(self.branch_tab_order)):
+            return
+        tab_key = self.branch_tab_order[index]
+        self._populate_branch_list(tab_key)
+        self._update_fetch_button_visibility(tab_key)
+        self._relayout(self.default_branch_name)
+        self.view.clear_branch_highlight()
+
     def on_branch_clicked(self, item: QListWidgetItem):
-        name = item.text()
+        name = item.data(Qt.UserRole) or item.text()
         if self.selected_branch_name == name:
             # 再點一次同一個分支 -> 取消高亮，主線恢復為預設分支
             self.selected_branch_name = None
@@ -819,16 +1110,39 @@ class MainWindow(QMainWindow):
             self.view.scroll_to_commit(tip_hash)
         self.status.showMessage(f"已將 '{name}' 設為主線，並標示其 {len(hashes)} 個 commits")
 
-    def refresh(self, _retry_after_fix: bool = False):
-        path = self.path_combo.currentText().strip()
+    def _clear_repo_state(self):
+        """清掉目前畫面上跟舊 repo 有關的所有資料（graph/branch tabs/選取狀態)，
+        避免切到一個空的或載入失敗的 repo 時，畫面還留著上一個 repo 的殘影。"""
+        self.raw_commits = None
+        self.last_render_data = None
+        self.view.clear()
+        self.branch_tab_data = {}
+        self.branch_tab_order = []
+        self.branch_tab_bar.blockSignals(True)
+        while self.branch_tab_bar.count() > 0:
+            self.branch_tab_bar.removeTab(0)
+        self.branch_tab_bar.blockSignals(False)
+        self.branch_list.clear()
+        self.selected_branch_name = None
+        self.default_branch_name = None
+        self.mainline_branch = None
+
+    def refresh(self, path: Optional[str] = None, _retry_after_fix: bool = False):
+        if path is None:
+            path = self.repo_path
+        path = (path or "").strip()
         if not path:
             return
         self.repo_path = path
+        self.path_display.setText(path)
+        self._clear_repo_state()
+        self.status.showMessage("Loading...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
         try:
             commits = load_commits(path, branch_scope="--all", limit=2000)
             if not commits:
                 self.status.showMessage("找不到任何 commit")
-                self.view.clear()
                 return
             self.raw_commits = commits
             branch_names = local_branch_names(path)
@@ -842,10 +1156,12 @@ class MainWindow(QMainWindow):
             self.view.render_commits(commits, edges, hash_to_commit, max_lanes)
             self.last_render_data = (commits, edges, hash_to_commit, max_lanes)
 
-            self.branch_list.clear()
-            self.selected_branch_name = None
-            for name in branch_names:
-                self.branch_list.addItem(QListWidgetItem(name))
+            tab_data = {"local": [(n, n) for n in branch_names]}
+            for remote in list_remote_names(path):
+                tab_data[remote] = [
+                    (n, f"{remote}/{n}") for n in remote_branch_names(path, remote)
+                ]
+            self._rebuild_branch_tabs(tab_data)
 
             self.status.showMessage(f"已載入 {len(commits)} 個 commits — {path}")
             self._remember_path(path)
@@ -858,6 +1174,8 @@ class MainWindow(QMainWindow):
             tb = traceback.format_exc()
             show_error_dialog(self, "錯誤", f"{e}\n\n--- 詳細錯誤 (debug用) ---\n{tb}")
             self.status.showMessage("載入失敗")
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _try_fix_safe_directory(self, error_text: str) -> bool:
         """偵測到 git 的 'dubious ownership' 錯誤時，從錯誤訊息中擷取 git 建議的
@@ -893,12 +1211,8 @@ class MainWindow(QMainWindow):
         recent.insert(0, norm_path)
         recent = recent[:MAX_RECENT_PATHS]
         save_recent_paths(recent)
-
-        self.path_combo.blockSignals(True)
-        self.path_combo.clear()
-        self.path_combo.addItems(recent)
-        self.path_combo.setEditText(norm_path)  # 顯示統一後的寫法，跟歷史清單一致
-        self.path_combo.blockSignals(False)
+        self._refresh_recent_menu()
+        self.path_display.setText(norm_path)  # 顯示統一後的寫法，跟歷史清單一致
 
 
 def main():
