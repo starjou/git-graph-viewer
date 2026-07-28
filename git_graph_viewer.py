@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Git Log Graph Viewer
-只讀取 git log,不執行任何寫入/變更類的 git 指令。
+以 git log 等唯讀指令讀取資料，不改動工作目錄、本地分支或 commit 歷史。
+唯一的寫入操作是使用者主動點擊 fetch 按鈕觸發的 git fetch（只更新遠端追蹤分支）。
 依賴: PySide6  (pip install PySide6 --break-system-packages)
 用法: python git_graph_viewer.py [repo_path]
 """
