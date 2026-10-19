@@ -1,5 +1,7 @@
 # Git Log Graph Viewer
 
+![Git Log Graph Viewer screenshot](docs/screenshot.png)
+
 一個用 Python + PySide6 寫成的輕量級 Git commit graph 圖形化檢視工具。讀取資料一律使用 `git log` 等**唯讀**指令，**不會**改動你的工作目錄、本地分支或 commit 歷史，也不會切換分支。
 
 唯一會寫入的情況是你主動點擊 remote 分頁上的 fetch 圖示，此時會執行 `git fetch <remote> --prune`，更新遠端追蹤分支（`refs/remotes/...`）；本地分支與工作目錄一樣不受影響。
